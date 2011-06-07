@@ -1,0 +1,284 @@
+#!/bin/bash
+# $Id: //depot/dev/sandbox/landers/home/bin/p4openzip#16 $ 
+
+#############################################################################
+# Zip [or unzip - see below] all p4 open files
+#
+# This makes (usually) several zip files:
+#   p4open_all.zip  - contains all open files
+#   p4open_12345.zip - contains open files from changelist 12345
+#   p4open_default.zip - contains open files from the default changelist
+# etc.
+#
+# The files in the zip will be relative to the client root directory
+#
+# Each zip file will also contain copies of the output from p4 opened and 
+# p4 client -o for the changelist.
+# The "all" zip will contain all these changelist descriptions.
+#
+# If there is only one changelist open, or all files are in the default changelist,
+# then only one zip (p4open_all.zip) is created.
+#
+# Limitations:
+#  Probably will break with files containing spaces
+#  Not tested on windows (cygwin bash)
+#
+#############################################################################
+#
+# UNZIP Option
+#
+# p4openzip -unzip p4open_<foo>.zip
+#
+# This will examine the appropriate changelist in the zip archive and
+# duplicate it in p4 (does not create a changelist, but just opens
+# the files as edit/add/delete) then extracts the archive.
+#
+# NOTE - unzip only works if the client spec mappings match the place where
+# they were zipped.
+#
+# NOTE - unzip does not account for unresolved updates or syncing to
+# vastly different changenumbers.
+#############################################################################
+
+
+if [ "${1}" = "-unzip" ]; then
+    # unzip an archive
+    #
+    # WARNING - unzip will do p4 edit/add/delete on files in the archive !
+    #
+    # fixup relative path
+    archive=`echo "${2}" | sed -e "s,^\([^/]\),${PWD}/\1,"`
+    
+    if [ ! -f "${archive}" ]; then
+        echo "File not found: ${archive}"
+        exit 1
+    fi
+    
+    # test that this is a new p4openzip archive with the P4_WHERE file
+    if unzip -Z "${archive}" P4_WHERE.txt >/dev/null 2>&1; then
+        # all is well
+        true
+    else
+        echo "This zip file was created with an old version of p4opnezip which did not"
+        echo "properly handle unzip.  You need to update and rebuild the zip file."
+        exit 1
+    fi
+    
+    # Extract files from changelist within archive
+    change=`basename "${archive}" | sed -e 's/^p4open_\(.*\)\.zip$/\1/'`
+
+    case "${change}" in
+        all)
+            filelist=`unzip -p "${archive}" P4_OPENED_ALL.txt | sed -n -e 's/^\([^#]*\)#[0-9][0-9]* - .*$/\1/p'`
+        ;;
+        default)
+            filelist=`unzip -p "${archive}" P4_CHANGE_default.txt | sed -n -e 's/^\([^#]*\)#[0-9][0-9]* - .*$/\1/p'`
+        ;;
+        [0-9]*)
+            lines=`unzip -p "${archive}" P4_CHANGE_${change}.txt | wc -l`
+            filelist=`unzip -p "${archive}" P4_CHANGE_${change}.txt | grep -A ${lines} '^Files:$' | tail --lines=+2 | sed -e 's/^[ \t]*//'`
+        ;;
+        *)
+            echo "Not a valid p4open archive file: ${archive}"
+            exit 1
+        ;;
+    esac
+
+    # deal with the files in p4
+
+    # go to root directory
+    rootdir=`p4 info | sed -n -e 's/^Client root: \(.*\)$/\1/p'`
+    cd ${rootdir}
+
+	# Before doing anything, check that we are at the same version for each file
+    # note - the filelist is depot file paths  
+    for f in ${filelist}; do
+    
+        # get the action from the ALL changelist
+        action=`unzip -p "${archive}" P4_OPENED_ALL.txt | sed -n -e "s,^${f}#[0-9][0-9]* - \([^ ]*\) .*,\1,p"`
+		
+        case "${action}" in
+            delete|edit|integrate)
+                # get version from the ALL list so we can check for resolves
+                archiveVersion=`unzip -p "${archive}" P4_OPENED_ALL.txt | sed -n -e "s,^${f}#\([0-9][0-9]*\) - .*,\1,p"`
+                haveVersion=`p4 have ${f} | sed -n -e "s,^${f}#\([0-9][0-9]*\) - .*,\1,p"`
+                if [ ${archiveVersion} -ne ${haveVersion} ]; then
+                    echo "The file versions in this zip file do not match those currently checked out."
+                    echo ${f}
+                    echo "Archive has version ${archiveVersion}, you have version ${haveVersion}"
+                    echo "Resolve conflicts and try again (no files were touched)."
+                    exit 1
+                fi
+                ;;
+            # not for add|branch
+        esac
+    done
+
+    # now do the checkouts
+    for f in ${filelist}; do
+    
+        # get the action from the ALL changelist
+        action=`unzip -p "${archive}" P4_OPENED_ALL.txt | sed -n -e "s,^${f}#[0-9][0-9]* - \([^ ]*\) .*,\1,p"`
+		
+        case "${action}" in
+            delete)
+                p4 delete "${f}"
+                ;;
+            edit|integrate)
+                p4 edit "${f}"
+                localfile=`p4 where "${f}" | cut -d\  -f3`
+                zipfile=`unzip -p "${archive}" P4_WHERE.txt | sed -n -e "s,^${f} - \(.*\)$,\1,p"`
+                unzip -p "${archive}" "${zipfile}" > "${localfile}"
+                ;;
+            add|branch)
+                p4 add "${f}"
+                localfile=`p4 where "${f}" | cut -d\  -f3`
+                zipfile=`unzip -p "${archive}" P4_WHERE.txt | sed -n -e "s,^${f} - \(.*\)$,\1,p"`
+                mkdir -p `dirname ${localfile}`
+                unzip -p "${archive}" "${zipfile}" > "${localfile}"
+                ;;
+        esac
+    done
+        
+    # extract the files
+
+
+    exit
+fi
+
+############################### Normal usage
+
+# tmp dir for work files and p4 output files
+tmpdir=/tmp/p4opened.$$
+rm -rf ${tmpdir}
+mkdir ${tmpdir}
+
+# Make a file with the complete output from p4 opened.
+# This will be reused in the commands and also included as a "manifest" in each zip
+allopen=${tmpdir}/P4_OPENED_ALL.txt
+
+# Construct a file containing just the file names and their changelist #
+# Getting changelists from p4 open (rather than p4 changes) 
+# means we include the default changelist and eliminate empty ones
+# and those including only files outside PWD
+# Out from p4 opened is like:
+#   //depot/dir/name#99 - edit default change (text)
+#   //depot/foo/bar#42 - edit change 123354 (xtext)
+# Create a file like this:
+#  default //depot/dir/name
+#  123354 //depot/foo/bar
+
+# Its a dotfile so it won't show up in the jar
+depotfiles=${tmpdir}/.depotfiles
+
+p4 opened ${openroot} | \
+    tee ${allopen} | \
+    sed -n -e 's/^\(.*\)#[0-9][0-9]* - \(.*\)$/\2|\1/' \
+        -e 's/^[^ ]* default change [^|]*|/default /p' \
+        -e 's/^[^ ]* change \([0-9][0-9]*\) [^|]*|/\1 /p' > ${depotfiles}
+
+# Now we need a list and count of the changelists
+changelists=`cut -d' ' -f1 ${depotfiles} | sort -u`
+numchangelists=`echo ${changelists} | wc -w`
+
+if [ ${numchangelists} -eq 0 ]; then
+    # There's nothing to do.
+    # The user already saw stderr "No files open" message from p4
+    # clean up tmpdir and leave
+    rm -rf ${tmpdir}
+    exit
+fi
+
+# Make the zip files...,
+
+# Base name for the zip files is "p4open"
+# Note this has to be a full absolute path because of the way zip is run from clientroot dir
+zipbase=${PWD}/p4open
+
+# Create the zip files relative to the client root dir for the p4 client
+# We also ensure that the client root ends with a single slash, as in /home/foo/ or c:/
+clientroot=`p4 info | tr '\\\\' '/' | sed -n -e 's|^Client root: \(.*[^/]\)/\{0,\}$|\1/|p'`
+cd ${clientroot}
+
+# This is probably usually going to be redundant, but if you have AltRoots set
+# in your client spec and you are using cygwin, then the client root may change
+# after we cd to that directory.  So original client root may be c:\home\, and
+# the alt root is /cygdrive/c/home/.  The first call to p4 info may report the
+# base client root, but this second one (after cd) will report the effective
+# root
+clientroot=`p4 info | tr '\\\\' '/' | sed -n -e 's|^Client root: \(.*[^/]\)/\{0,\}$|\1/|p'`
+
+# make a 'where' file so we know where each file in the
+# zip maps to the depot
+wherefile=${tmpdir}/P4_WHERE.txt
+cut -d' ' -f2 ${depotfiles}  | \
+    xargs p4 where | \
+    cut -d' ' -f1,3 | \
+    tr '\\\\' '/' | \
+    sed -n -e "s|^\([^ ]*\) ${clientroot}|\1 - |p" > ${wherefile}
+
+function zipcmd()
+{
+    zipfile=$1
+    shift
+
+    [ -e ${zipfile} ] && mv ${zipfile} ${zipfile}.old
+    
+    zip -q ${zipfile} -@ -j ${*}
+    echo Created ${zipfile}
+}
+
+function mkzip()
+{
+    # has (possibly grep'ed) output from $depotfiles on stdin
+    # $1 is zip file name, rest of args are "manifest" files
+            
+    # pump the depot filenames thru p4 where to find out
+    # where they live on the client.
+    # when given a depot file, p4 where burps up something like:
+    #   //depot/file/name  //client_spec/dir/file/name  /client/root/dir/file/name
+    # strip off the client root dir and make it relative (replace it with .)
+    # zip up those files and also include the manifests from tmpdir (-j = junk the dir)
+    cut -d' ' -f2 | \
+        xargs p4 where | \
+        cut -d' ' -f3 | \
+        tr '\\\\' '/' | \
+        sed -e "s|^${clientroot}||" | \
+        zipcmd ${*}
+}
+
+
+# Do for each changelist...
+for change in ${changelists}; do
+
+    # Make a manifest file for the changelist to describe the contents
+    mf=${tmpdir}/P4_CHANGE_${change}.txt
+    
+    if [ "${change}" != "default" ]; then
+        # manifest contains p4 change
+        p4 change -o ${change} | grep -v '^#' > ${mf}
+    else
+        # there is no changelist for default change, so all
+        # we can provide is the open file list, which will include
+        # the change action (edit, delete, add) which is what we want
+        p4 opened | egrep "^.* default change .*$" > ${mf}
+    fi
+
+    # If the only changelist is default, then don't make a 
+    # special zip for it (it will be in all), but if the change
+    # is numbered then make a zip for it (and all).
+    if [ ${numchangelists} -ne 1 -o "${change}" != "default" ]; then
+        grep "^${change} " ${depotfiles} | mkzip ${zipbase}_${change}.zip ${mf} ${wherefile} ${allopen}
+    fi
+done
+
+# always make a zip file for all open files
+
+mkzip ${zipbase}_all.zip ${tmpdir}/* < ${depotfiles}
+
+# get back to old dir (probably not necessary)
+cd ${OLDPWD}
+
+# clean up
+rm -rf ${tmpdir}
+
